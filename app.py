@@ -1,102 +1,148 @@
-import os
+# app.py
+from flask import Flask
+import threading
+import time
 import requests
-from flask import Flask, request, Response, jsonify  # 增加了 jsonify
+import os
+import logging
+
+# --- 配置 ---
+# 基本日志设置
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# 从环境变量读取配置，并提供默认值（尽管在生产中最好不要硬编码敏感信息）
+CLOUDFLARE_API_URL = os.environ.get('CLOUDFLARE_API_URL')  # 例如: "https://<your-pages-url>/api/message"
+CLOUDFLARE_API_KEY = os.environ.get('CLOUDFLARE_API_KEY')
+
+TARGET_API_URL_BASE = os.environ.get('TARGET_API_URL_BASE', "http://47.108.147.164:5001/send")
+TARGET_API_KEY = os.environ.get('TARGET_API_KEY', "sUpErS3cr3tK3y!")  # 从您的示例中获取
+
+FORWARD_INTERVAL_SECONDS = int(os.environ.get('FORWARD_INTERVAL_SECONDS', "60"))
 
 app = Flask(__name__)
 
-# 从环境变量中获取目标服务器的基础 URL
-TARGET_BASE_URL = os.environ.get('TARGET_BASE_URL')
 
-if not TARGET_BASE_URL:
-    app.logger.warning(
-        "TARGET_BASE_URL environment variable not set. Using default: http://localhost:8080 (for testing only)")
-    TARGET_BASE_URL = "http://localhost:8080"
-
-HOP_BY_HOP_HEADERS = [
-    'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
-    'te', 'trailers', 'transfer-encoding', 'upgrade', 'content-encoding',
-    'content-length'
-]
-
-
-# 新增：简单的 GET /hello 接口
-@app.route('/hello', methods=['GET'])
-def hello_world():
-    app.logger.info("Received request for /hello endpoint.")
-    # 为了与接口风格统一，也可以返回 JSON 格式
-    # return "hello"
-    return jsonify({"message": "hello"}), 200
+def check_env_vars():
+    """检查是否所有必需的环境变量都已设置。"""
+    required_vars = {
+        "CLOUDFLARE_API_URL": CLOUDFLARE_API_URL,
+        "CLOUDFLARE_API_KEY": CLOUDFLARE_API_KEY,
+        # TARGET_API_URL_BASE 和 TARGET_API_KEY 有默认值，但仍建议通过环境变量配置
+    }
+    missing_vars = [name for name, value in required_vars.items() if not value]
+    if missing_vars:
+        logger.error(f"警告: 缺少关键环境变量: {', '.join(missing_vars)}. 转发功能可能无法正常工作。")
+        return False
+    logger.info("所有关键环境变量已配置。")
+    return True
 
 
-# 通用转发接口 (捕获所有其他路径)
-@app.route('/', defaults={'path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'])
-@app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'])
-def forward_request(path):
-    # 确保 /hello 路径不会进入这里 (虽然 Flask 路由优先级通常会处理好)
-    if request.path == '/hello':
-        # 此检查理论上不需要，因为 /hello 路由会先匹配
-        # 但作为双重保险或用于日志记录特定情况
-        app.logger.debug("Forward request logic explicitly skipping /hello path.")
-        # 实际上，如果 Flask 路由正确，这段代码块不会被执行
-        return hello_world()  # 或者返回一个错误，表明不应通过此路径访问
+ENV_VARS_CONFIGURED = check_env_vars()
 
-    if not TARGET_BASE_URL:
-        app.logger.error("TARGET_BASE_URL not configured for forwarding.")
-        return jsonify({"error": "Proxy target not configured."}), 503
 
-    target_url_path = request.full_path
-    if target_url_path.startswith('/'):
-        target_url_path = target_url_path[1:]
+def fetch_and_forward():
+    """从Cloudflare获取消息并将其转发到目标API。"""
+    if not ENV_VARS_CONFIGURED:
+        # 如果在启动时已经记录了错误，这里可以选择安静地跳过或记录一个更简洁的警告
+        logger.debug("环境变量未完全配置。跳过此轮获取和转发。")
+        return
 
-    final_target_url = f"{TARGET_BASE_URL.rstrip('/')}/{target_url_path.lstrip('/')}"
-
-    app.logger.info(f"Forwarding {request.method} request from {request.remote_addr} to: {final_target_url}")
-
-    forward_headers = {key: value for key, value in request.headers if key.lower() not in HOP_BY_HOP_HEADERS}
-    if 'Host' in forward_headers:
-        del forward_headers['Host']
-
-    request_body = request.get_data()
-
+    logger.info("开始尝试从Cloudflare获取消息...")
     try:
-        target_resp = requests.request(
-            method=request.method,
-            url=final_target_url,
-            headers=forward_headers,
-            data=request_body,
-            stream=True,
-            allow_redirects=False,
-            timeout=30
-        )
+        # 1. 从Cloudflare获取消息
+        if not CLOUDFLARE_API_URL or not CLOUDFLARE_API_KEY:
+            logger.error("Cloudflare API URL或Key未配置。")
+            return
+
+        fetch_url = f"{CLOUDFLARE_API_URL}?key={CLOUDFLARE_API_KEY}"
+        response = requests.get(fetch_url, timeout=10)  # 为请求设置超时
+        response.raise_for_status()  # 如果状态码是4xx或5xx，则抛出HTTPError
+
+        data = response.json()
+        logger.debug(f"从Cloudflare接收到的数据: {data}")
+
+        if data.get("success") and data.get("data"):
+            message_data = data["data"]
+            title = message_data.get("title", "无标题")  # 如果缺少标题，则使用默认值
+            content = message_data.get("content")
+
+            if not content:  # 内容是必需的
+                logger.warning(f"获取到的消息 ID {message_data.get('id', 'N/A')} 没有内容。跳过转发。")
+                return
+
+            message_id_log = message_data.get('id', 'N/A')
+            logger.info(f"获取到消息 ID {message_id_log}: '{title[:50]}...'")  # 记录标题的片段
+
+            # 2. 将消息转发到目标API
+            if not TARGET_API_URL_BASE or not TARGET_API_KEY:
+                logger.error("目标API URL或Key未配置。")
+                return
+
+            forward_url = f"{TARGET_API_URL_BASE}?key={TARGET_API_KEY}"
+            payload = {
+                "title": title,
+                "content": content
+            }
+
+            logger.debug(f"准备转发到 {forward_url}，内容: {payload}")
+            forward_response = requests.post(forward_url, json=payload, timeout=15)  # 为转发设置超时
+            forward_response.raise_for_status()
+
+            logger.info(f"消息 ID {message_id_log} 已成功转发到目标。状态码: {forward_response.status_code}")
+
+        elif data.get("success") and data.get("data") is None:
+            logger.info("Cloudflare上没有可供转发的新消息。")
+        else:
+            logger.warning(f"未能从Cloudflare获取有效消息或收到意外响应。响应: {data}")
+
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"HTTP错误: {e.response.status_code} - {e.response.text} (请求URL: {e.request.url})")
     except requests.exceptions.Timeout:
-        app.logger.error(f"Timeout error connecting to target server {final_target_url}")
-        return jsonify(
-            {"error": f"Proxy error: Timeout connecting to target server {final_target_url}"}), 504  # Gateway Timeout
-    except requests.exceptions.ConnectionError:
-        app.logger.error(f"Connection error connecting to target server {final_target_url}")
-        return jsonify(
-            {"error": f"Proxy error: Could not connect to target server {final_target_url}"}), 502  # Bad Gateway
+        logger.error(f"请求超时 (URL: {fetch_url if 'fetch_url' in locals() else 'N/A'})")
     except requests.exceptions.RequestException as e:
-        app.logger.error(f"General request error connecting to target server {final_target_url}: {e}")
-        return jsonify({"error": f"Proxy error: {str(e)}"}), 500
-
-    response_headers = []
-    for key, value in target_resp.raw.headers.items():
-        if key.lower() not in HOP_BY_HOP_HEADERS:
-            response_headers.append((key, value))
-
-    def generate_response_content():
-        try:
-            for chunk in target_resp.iter_content(chunk_size=8192):
-                yield chunk
-        finally:
-            target_resp.close()  # 确保在流完成后关闭连接
-
-    response_from_proxy = Response(generate_response_content(), status=target_resp.status_code,
-                                   headers=response_headers)
-
-    return response_from_proxy
+        logger.error(f"请求失败: {e} (URL: {e.request.url if e.request else 'N/A'})")
+    except Exception as e:
+        logger.error(f"在fetch_and_forward中发生意外错误: {e}", exc_info=True)
 
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=os.environ.get('FLASK_DEBUG', 'false').lower() == 'true')
+def scheduled_task_runner():
+    """定期运行fetch_and_forward任务。"""
+    if not ENV_VARS_CONFIGURED:
+        # 此处不再重复记录错误，因为check_env_vars已在启动时记录
+        return
+
+    logger.info(f"调度器已启动。每 {FORWARD_INTERVAL_SECONDS} 秒运行一次 fetch_and_forward。")
+    while True:
+        fetch_and_forward()
+        time.sleep(FORWARD_INTERVAL_SECONDS)
+
+
+@app.route('/')
+def health_check():
+    """一个简单的服务健康检查端点。"""
+    if ENV_VARS_CONFIGURED:
+        # 检查后台线程是否仍在运行 (基本检查)
+        if 'scheduler_thread' in globals() and scheduler_thread.is_alive():
+            return "转发服务正在运行且已配置。调度器活动。", 200
+        else:
+            return "转发服务正在运行但调度器似乎未激活或配置不完整。", 500
+    else:
+        return "转发服务正在运行但未配置 (缺少环境变量)。", 503
+
+
+# 当模块加载时启动后台调度器线程。
+# 这意味着每个Gunicorn worker都会有自己的调度器线程。
+if ENV_VARS_CONFIGURED:
+    scheduler_thread = threading.Thread(target=scheduled_task_runner, daemon=True)
+    scheduler_thread.start()
+    logger.info("后台调度器线程已启动。")
+else:
+    logger.warning("由于缺少环境变量，后台调度器未启动。")
+
+# 'app' 对象将被Gunicorn获取。
+# 如果您直接运行 `python app.py`，您需要添加以下代码块来运行Flask开发服务器：
+# if __name__ == "__main__":
+#     # 注意：直接运行 app.run() 时，上面的 scheduler_thread 已经启动了。
+#     # 对于生产环境，请使用Gunicorn。
+#     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
